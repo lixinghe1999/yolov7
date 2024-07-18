@@ -600,6 +600,7 @@ class Model(nn.Module):
 
     def forward_once(self, x, profile=False):
         y, dt = [], []  # outputs
+        self.tensor_size = [x.nelement() * x.element_size() / 1024 / 1024]
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
@@ -620,16 +621,57 @@ class Model(nn.Module):
                 for _ in range(10):
                     m(x.copy() if c else x)
                 dt.append((time_synchronized() - t) * 100)
-                print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
+                
+                print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type,))
 
             x = m(x)  # run
-            
             y.append(x if m.i in self.save else None)  # save output
 
+            # save all the tensor size
+            if profile:
+                if type(x) == list:
+                        size_tensor_MB = 0
+                        for _x in x:
+                            size_tensor_MB += _x.nelement() * _x.element_size() / 1024 / 1024
+                else:
+                    size_tensor_MB = x.nelement() * x.element_size() / 1024 / 1024
+                self.tensor_size.append(size_tensor_MB)
         if profile:
+            self.new_tensor_size = []
+            self.num_related_layers = []
+            for i in range(len(self.model)):
+                tensor_size = 0
+                related_layers = self.transmit_layers(i)
+                self.num_related_layers.append(len(related_layers))
+                for _f in related_layers:
+                    tensor_size += self.tensor_size[_f]
+                self.new_tensor_size.append(tensor_size)
             print('%.1fms total' % sum(dt))
         return x
-
+    def transmit_layers(self, bottleneck_idx):
+        '''
+        if the network is cut at bottleneck, only parts of the network will be transmitted
+        '''
+        related_layers = []
+        for j in range(bottleneck_idx, len(self.model)):
+            f = self.model[j].f
+            if type(f) == list:
+                for _f in f:
+                    if _f < 0:
+                        _f = j + _f + 1
+                    else:
+                        _f = _f
+                    if _f <= bottleneck_idx:
+                        related_layers.append(_f)
+            else:
+                if f < 0:
+                    _f = j + f + 1
+                else:
+                    _f = f
+                if _f <= bottleneck_idx:
+                    related_layers.append(_f)
+        related_layers = list(set(related_layers))
+        return related_layers
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
@@ -734,7 +776,7 @@ class Model(nn.Module):
 
 
 def parse_model(d, ch):  # model_dict, input_channels(3)
-    logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
+    # logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
@@ -804,7 +846,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum([x.numel() for x in m_.parameters()])  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
+        # logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
@@ -830,6 +872,7 @@ if __name__ == '__main__':
     if opt.profile:
         img = torch.rand(1, 3, 640, 640).to(device)
         y = model(img, profile=True)
+        print(model.tensor_size)
 
     # Profile
     # img = torch.rand(8 if torch.cuda.is_available() else 1, 3, 640, 640).to(device)
